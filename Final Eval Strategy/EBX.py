@@ -80,7 +80,7 @@ def prepare_derived_features(df: pd.DataFrame, strategy_params: dict) -> pd.Data
     df["ATR_High"] = df["ATR"].expanding(min_periods=1).max()
 
     # --- STD Calculation ---
-    std = df[strategy_params["pb9t1"]].rolling(window=60, min_periods=1).std()
+    std = df[strategy_params["pb9t1"]].rolling(window=120, min_periods=1).std()
     df["STD"] = std.shift(1)
     df["STD_High"] = df["STD"].expanding(min_periods=1).max()
 
