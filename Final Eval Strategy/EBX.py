@@ -175,7 +175,7 @@ def process_day(file_path: str, day_num: int, temp_dir: pathlib.Path, strategy_p
 
         # Parameters
         TAKE_PROFIT = 0.35   # activate trailing after this
-        TRAIL_STOP = 0.1   # trail amount
+        TRAIL_STOP = 0.15   # trail amount
 
         for i in range(len(df)):
             row = df.iloc[i]
