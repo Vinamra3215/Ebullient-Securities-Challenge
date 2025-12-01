@@ -119,7 +119,7 @@ def prepare_derived_features(df: pd.DataFrame, strategy_params: dict) -> pd.Data
     wma9_half = wma(df["Price"], 9//2)
     df["HMA_9"] = (2 * wma9_half - wma9).rolling(3).mean().shift(1)
     df["EMA_120"] = df["Price"].ewm(span=130, adjust=False).mean().shift(1)
-    df["SMA_200"] = df["Price"].rolling(200).mean().shift(1)
+    df["SMA_200"] = df["Price"].rolling(240).mean().shift(1)
 
     return df
 
