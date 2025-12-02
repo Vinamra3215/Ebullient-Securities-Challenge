@@ -5,6 +5,7 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 
+
 # ==========================================================
 # CONFIGURATION
 # ==========================================================
@@ -12,8 +13,13 @@ DATA_DIR = Path("/data/quant14/EBX")
 DAY_TO_PLOT = 87
 PRICE_COLUMN = "Price"
 TIME_COLUMN = "Time"
-NUM_BUCKETS = 80     # number of price buckets for density (increase for higher resolution)
+
+NUM_BUCKETS = 80
+ROLL_SEC = 180          # rolling window for U-turns
+U_TURN_THRESHOLD = 90   # <-- NEW: threshold to color price red
 # ==========================================================
+
+
 
 # ----------------------------------------------------------
 # Load Data
@@ -26,93 +32,183 @@ print(f"Loaded {len(df):,} rows from Day {DAY_TO_PLOT}")
 df_pd = df[[TIME_COLUMN, PRICE_COLUMN]].to_pandas()
 df_pd[TIME_COLUMN] = pd.to_timedelta(df_pd[TIME_COLUMN])
 
-print(f"Price range: ${df_pd[PRICE_COLUMN].min():.2f} - ${df_pd[PRICE_COLUMN].max():.2f}")
-
-
-# ==========================================================
-# TAPE READING — PRICE DENSITY (TIME AT PRICE)
-# ==========================================================
 prices = df_pd[PRICE_COLUMN].to_numpy(dtype=float)
 times = df_pd[TIME_COLUMN].to_numpy()
 
-# Convert timedelta → seconds
-time_sec = (times - times[0]).astype('timedelta64[ms]').astype(float) / 1000.0
+print(f"Price range: {prices.min():.4f} – {prices.max():.4f}")
 
-# Time difference between ticks
+
+
+# ==========================================================
+# TIME → SECONDS
+# ==========================================================
+time_sec = (times - times[0]).astype("timedelta64[ms]").astype(float) / 1000.0
+
+# Δt between ticks
 dt = np.diff(time_sec)
-dt = np.append(dt, dt[-1])   # last tick uses same dt
+dt = np.append(dt, dt[-1])
 
-# Create equal-width price buckets
+
+
+# ==========================================================
+# PRICE DENSITY (Tape Reading)
+# ==========================================================
 p_min, p_max = prices.min(), prices.max()
 bins = np.linspace(p_min, p_max, NUM_BUCKETS)
 
-# Which bucket each price belongs to
-bucket_index = np.digitize(prices, bins) - 1
-bucket_index = np.clip(bucket_index, 0, NUM_BUCKETS - 1)
+bucket_idx = np.digitize(prices, bins) - 1
+bucket_idx = np.clip(bucket_idx, 0, NUM_BUCKETS - 1)
 
-# Time spent in each bucket
 price_density = np.zeros(NUM_BUCKETS)
 for i in range(len(prices)):
-    price_density[bucket_index[i]] += dt[i]
+    price_density[bucket_idx[i]] += dt[i]
 
-# Normalize 0–1 for easier plotting
-price_density_norm = price_density / price_density.max()
+price_density_norm = price_density / np.max(price_density)
 
-# Midpoints for plotting
 bin_centers = (bins[:-1] + bins[1:]) / 2
 bin_centers = np.append(bin_centers, bins[-1] - (bins[-1] - bins[-2]) / 2)
 
 
+
 # ==========================================================
-# PLOT PRICE + PRICE DENSITY
+# ROLLING U-TURN COUNT (CHOPPINESS)
+# ==========================================================
+print("\nComputing U-turn counts...")
+
+diff_p = np.diff(prices)
+direction = np.sign(diff_p)
+direction = np.append(direction, 0)
+
+U_count = np.zeros(len(prices))
+
+left = 0
+n = len(prices)
+
+for right in range(1, n):
+
+    while time_sec[right] - time_sec[left] > ROLL_SEC:
+        left += 1
+
+    d_win = direction[left:right+1]
+    d_win = d_win[d_win != 0]
+
+    if len(d_win) > 1:
+        flips = np.sum(np.diff(np.sign(d_win)) != 0)
+    else:
+        flips = 0
+
+    U_count[right] = flips
+
+df_pd["U_Turns"] = U_count/180
+
+
+
+# ==========================================================
+# PRICE COLORING BASED ON U-TURN THRESHOLD
+# ==========================================================
+segments = []
+cur_x, cur_y = [], []
+cur_color = None
+
+for i in range(len(prices)):
+
+    uval = U_count[i]
+    color = "red" if uval > U_TURN_THRESHOLD else "black"
+
+    if cur_color is None:
+        cur_color = color
+
+    # If color changes, store previous segment
+    if color != cur_color:
+        segments.append((cur_x, cur_y, cur_color))
+        cur_x, cur_y = [], []
+        cur_color = color
+
+    cur_x.append(times[i])
+    cur_y.append(prices[i])
+
+# append final
+segments.append((cur_x, cur_y, cur_color))
+
+
+
+# ==========================================================
+# PLOTTING
 # ==========================================================
 fig = make_subplots(
-    rows=2, cols=1,
+    rows=3, cols=1,
     shared_xaxes=False,
-    vertical_spacing=0.12,
-    row_heights=[0.75, 0.25],
-    subplot_titles=(
-        f"Price — Day {DAY_TO_PLOT}",
-        "Tape Reading: Price Density (Time at Price)"
+    vertical_spacing=0.10,
+    row_heights=[0.55, 0.25, 0.20],
+    subplot_titles=[
+        f"Price — U-turn Coloring (>{U_TURN_THRESHOLD})",
+        "Price Density (Tape Reading)",
+        "Rolling U-turn Count (Choppiness 180 sec)"
+    ]
+)
+
+
+# -------------------------------
+# (1) PRICE PANEL WITH COLORING
+# -------------------------------
+for xs, ys, col in segments:
+    fig.add_trace(
+        go.Scatter(
+            x=xs,
+            y=ys,
+            mode="lines",
+            line=dict(color=col, width=2),
+            showlegend=False
+        ),
+        row=1, col=1
     )
-)
+
+
 
 # -------------------------------
-# PRICE PANEL (Top)
-# -------------------------------
-fig.add_trace(
-    go.Scatter(
-        x=df_pd[TIME_COLUMN],
-        y=df_pd[PRICE_COLUMN],
-        mode="lines",
-        line=dict(color="black", width=2),
-        name="Price",
-    ),
-    row=1, col=1
-)
-
-# -------------------------------
-# PRICE DENSITY PANEL (Bottom)
+# (2) PRICE DENSITY BARPLOT
 # -------------------------------
 fig.add_trace(
     go.Bar(
         x=bin_centers,
         y=price_density_norm,
-        name="Price Density",
-        marker=dict(color="blue", opacity=0.7)
+        marker=dict(color="blue", opacity=0.7),
+        name="Price Density"
     ),
     row=2, col=1
 )
 
+
+
+# -------------------------------
+# (3) U-TURN PANEL
+# -------------------------------
+fig.add_trace(
+    go.Scatter(
+        x=df_pd[TIME_COLUMN],
+        y=df_pd["U_Turns"],
+        mode="lines",
+        line=dict(color="purple", width=2),
+        name="U-Turns"
+    ),
+    row=3, col=1
+)
+
+
+
+# -------------------------------
+# LAYOUT
+# -------------------------------
 fig.update_layout(
-    title=f"Day {DAY_TO_PLOT} — Price Chart + Tape Reading Density",
+    title=f"Tape Reading + U-Turn Choppiness — Day {DAY_TO_PLOT}",
     template="plotly_white",
     hovermode="x unified",
-    height=900,
+    height=950,
     showlegend=False
 )
 
-fig.update_yaxes(title_text="Price ($)", row=1, col=1)
+fig.update_yaxes(title_text="Price", row=1, col=1)
 fig.update_yaxes(title_text="Density", row=2, col=1)
+fig.update_yaxes(title_text="U-Turns", row=3, col=1)
 
 fig.show()
