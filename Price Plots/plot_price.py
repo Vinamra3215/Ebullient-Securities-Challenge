@@ -7,7 +7,7 @@ from pathlib import Path
 # CONFIGURATION
 # ==========================================================
 DATA_DIR = Path("/data/quant14/EBX")  # directory containing dayX.parquet files
-DAY_TO_PLOT = 64            # <-- change this to any day number you want to visualize
+DAY_TO_PLOT = 87            # <-- change this to any day number you want to visualize
 PRICE_COLUMN = "Price"
 TIME_COLUMN = "Time"                  # make sure your parquet has this column
 # ==========================================================
