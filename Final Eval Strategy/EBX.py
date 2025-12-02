@@ -70,47 +70,6 @@ def prepare_derived_features(df: pd.DataFrame, strategy_params: dict) -> pd.Data
     df["STD"] = std.shift(1)
     df["STD_High"] = df["STD"].expanding(min_periods=1).max()
 
-    ss = df["Price"].ewm(span=30, adjust=False).mean()
-    eama_period = 15
-    eama_fast = 30
-    eama_slow = 120
-
-    direction_ss = ss.diff(eama_period).abs()
-    volatility_ss = ss.diff().abs().rolling(eama_period).sum()
-    er_ss = (direction_ss / volatility_ss).fillna(0)
-
-    fast_sc = 2/(eama_fast+1)
-    slow_sc = 2/(eama_slow+1)
-    sc_ss = ((er_ss*(fast_sc - slow_sc)) + slow_sc)**2
-
-    eama = np.zeros(len(ss))
-    eama[0] = ss.iloc[0]
-
-    for i in range(1, len(ss)):
-        eama[i] = eama[i-1] + sc_ss.iloc[i] * (ss.iloc[i] - eama[i-1])
-
-    df["EAMA"] = eama
-    df["EAMA_Slope"] = pd.Series(eama).diff().fillna(0)
-    df["EAMA_Slope_MA"] = pd.Series(eama).rolling(5).mean().fillna(0)
-
-    prices_np = df["Price"].values.astype(float)
-    ekf = ExtendedKalmanFilter(dim_x=1, dim_z=1)
-    ekf.x = np.array([[prices_np[0]]])
-    ekf.F = np.array([[1.0]])
-    ekf.Q = np.array([[0.05]])
-    ekf.R = np.array([[0.2]])
-
-    def h(x): return np.log(x)
-    def H_jac(x): return np.array([[1.0 / x[0][0]]])
-
-    ekf_vals = []
-    for p in prices_np:
-        ekf.predict()
-        ekf.update(np.array([[np.log(p)]]), HJacobian=H_jac, Hx=h)
-        ekf_vals.append(ekf.x.item())
-
-    df["EKFTrend"] = pd.Series(ekf_vals).shift(1).bfill()
-
     def wma(arr, period):
         weights = np.arange(1, period + 1)
         return pd.Series(arr).rolling(period).apply(lambda x: np.dot(x, weights) / weights.sum(), raw=True)
@@ -153,43 +112,12 @@ def process_day(file_path: str, day_num: int, temp_dir: pathlib.Path, strategy_p
         
         # Immediate cleanup of GPU dataframe
         del gdf
-        
-        if df.empty:
-            print(f"⚠ Day {day_num} empty, skipping.")
-            return None
 
         df = df.reset_index(drop=True)
         df = df.sort_values("Time").reset_index(drop=True)
         df["Time_sec"] = pd.to_timedelta(df["Time"].astype(str)).dt.total_seconds().astype(int)
 
         df = prepare_derived_features(df, strategy_params)
-
-        # Heiken-Ashi Preparation
-        tmp = df[["Time", "Price"]].copy()
-        tmp["Time_dt"] = pd.to_timedelta(tmp["Time"].astype(str))
-        tmp = tmp.set_index("Time_dt")
-
-        ohlc = tmp["Price"].resample("5s").ohlc().dropna()
-        ha = pd.DataFrame(index=ohlc.index)
-        ha["close"] = (ohlc["open"] + ohlc["high"] + ohlc["low"] + ohlc["close"]) / 4
-        ha["open"] = np.nan
-
-        if len(ha) > 0:
-            ha.iloc[0, ha.columns.get_loc("open")] = (ohlc["open"].iloc[0] + ohlc["close"].iloc[0]) / 2
-            for i in range(1, len(ha)):
-                ha.iloc[i, ha.columns.get_loc("open")] = (ha["open"].iloc[i-1] + ha["close"].iloc[i-1]) / 2
-
-        ha["is_red"] = ha["close"] < ha["open"]
-        ha["is_green"] = ha["close"] > ha["open"]
-
-        df["Time_dt"] = pd.to_timedelta(df["Time"].astype(str))
-        ha_is_red_reindexed = ha["is_red"].reindex(df["Time_dt"].values, method="ffill").astype(bool).values
-        ha_is_green_reindexed = ha["is_green"].reindex(df["Time_dt"].values, method="ffill").astype(bool).values
-
-        df["HA_red"] = ha_is_red_reindexed.astype(int)
-        df["HA_green"] = ha_is_green_reindexed.astype(int)
-
-        del tmp, ohlc, ha
 
         # Trading Loop
         position = 0
@@ -285,8 +213,9 @@ def process_day(file_path: str, day_num: int, temp_dir: pathlib.Path, strategy_p
 
         output_path = temp_dir / f"day{day_num}.csv"
         final_columns = REQUIRED_COLUMNS + list(strategy_params.values()) + [
-            "Signal", "Position", "KAMA", "KAMA_Slope", "ATR", "STD", "HA_red", "HA_green"
+            "Signal", "Position", "KAMA", "KAMA_Slope", "ATR", "STD"
         ]
+
         df[final_columns].to_csv(output_path, index=False)
         print(f"✅ Processed Day {day_num}")
         
