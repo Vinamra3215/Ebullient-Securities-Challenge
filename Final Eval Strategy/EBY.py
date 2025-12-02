@@ -118,23 +118,23 @@ def prepare_derived_features(df: pd.DataFrame, strategy_params: dict) -> pd.Data
     wma9 = wma(df["Price"], 9)
     wma9_half = wma(df["Price"], 9//2)
     df["HMA_9"] = (2 * wma9_half - wma9).rolling(3).mean().shift(1)
-    df["EMA_120"] = df["Price"].ewm(span=130, adjust=False).mean().shift(1)
-    df["SMA_200"] = df["Price"].rolling(200).mean().shift(1)
+    df["EMA_130"] = df["Price"].ewm(span=130, adjust=False).mean().shift(1)
+    df["SMA_240"] = df["Price"].rolling(240).mean().shift(1)
 
     return df
 
 def generate_signal(row, position, cooldown_over, strategy_params):
     signal = 0
     ATR_THRESHOLD = 0.0
-    STD_THRESHOLD = 0.08
+    STD_THRESHOLD = 0.1
     KAMA_SLOPE_ENTRY = 0.0008
 
     if cooldown_over:
         volatility_confirmed = (row["ATR_High"] > ATR_THRESHOLD and row["STD_High"] > STD_THRESHOLD)
         
         if position == 0 and volatility_confirmed:
-            trend_long  = (row["HMA_9"] > row["EMA_120"] > row["SMA_200"])
-            trend_short = (row["HMA_9"] < row["EMA_120"] < row["SMA_200"])
+            trend_long  = (row["HMA_9"] > row["EMA_130"] > row["SMA_240"])
+            trend_short = (row["HMA_9"] < row["EMA_130"] < row["SMA_240"])
 
             if trend_long and row["KAMA_Slope"] > KAMA_SLOPE_ENTRY:
                 signal = 1
