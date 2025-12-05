@@ -14,75 +14,274 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from numba import njit, int64, float64
 
 # --- Configuration ---
-TEMP_DIR = "/data/quant14/signals/VB2_temp_signal_processing_combined"
-OUTPUT_FILE = "/data/quant14/signals/combined_trading_signals.csv"
+TEMP_DIR = "/data/quant14/signals/VB2_temp_signal_processing"
+OUTPUT_FILE = "/data/quant14/signals/temp_trading_signals_EBY.csv"
 REQUIRED_COLUMNS = ['Time', 'Price']
 
 # Blacklist
 BLACKLIST_DAYS = {104, 165, 110, 115, 6, 209, 135}
 
-# Strategy Parameters (Files)
+# Strategy Parameters
 STRATEGY_PARAMS = {
     "pb9t1": "PB9_T1", 
 }
 
-# --- GLOBAL SETTINGS ---
+# --- PARAMETERS ---
+# Volatility Gating (First 30 Minutes)
 DECISION_WINDOW_SECONDS = 30 * 60
-MU_THRESHOLD = 100.0  # The divider between strategies
+MU_THRESHOLD = 100.0
+
+# Sigma Thresholds for Strategy Selection
+SIGMA_HIGH_THRESHOLD = 0.12  # Strategy 1: sigma > 0.12
+SIGMA_MID_MIN = 0.09         # Strategy 2: 0.09 <= sigma <= 0.12
+SIGMA_MID_MAX = 0.12
+
+# === STRATEGY 1 PARAMETERS (HIGH VOLATILITY - SHORT FIRST) ===
+# 1. Primary Entry (Short)
+S1_ENTRY_RISE_THRESHOLD = 0.8
+
+# 2. Primary Exit (Short)
+S1_PRIMARY_STATIC_SL = 0.7
+S1_PRIMARY_TP_ACTIVATION = 0.65
+S1_PRIMARY_TRAIL_CALLBACK = 0.15
+
+# 3. Reversal Trigger (Long)
+S1_REVERSAL_DROP_TRIGGER = 0.2
+
+# 4. Reversal Exit (Long)
+S1_SECONDARY_STATIC_SL = 0.15
+S1_SECONDARY_TP_ACTIVATION = 0.8
+S1_SECONDARY_TRAIL_CALLBACK = 0.1
+
+# 5. Pre-Rise Long Stop Loss
+S1_PRE_RISE_SL = 0.4
+
+# === STRATEGY 2 PARAMETERS (MID VOLATILITY - LONG FIRST) ===
+# Entry (Long)
+S2_ENTRY_DROP_THRESHOLD = 0.9
+
+# Exit (Long)
+S2_STATIC_SL = 4.0
+S2_TP_ACTIVATION = 1.0
+S2_TRAIL_CALLBACK = 0.1
+
+# Reversal (Short)
+S2_REVERSAL_RISE_TRIGGER = 0.2
+
+# Exit (Short)
+S2_SHORT_STATIC_SL = 0.15
+S2_SHORT_TP_ACTIVATION = 5.2
+S2_SHORT_TRAIL_CALLBACK = 0.04
+
 COOLDOWN_PERIOD_SECONDS = 5
 
-# ==============================================================================
-# STRATEGY 1 PARAMETERS (Active when Mu > 100)
-# Logic: Gap Fill Long -> Main Short -> Reversal Long
-# ==============================================================================
-HIGH_MU_ENTRY_RISE_THRESHOLD = 0.8
-HIGH_MU_PRE_RISE_SL = 0.4               # <--- NEW: Pre-Rise Long Stop Loss
-HIGH_MU_PRIMARY_STATIC_SL = 0.7
-HIGH_MU_PRIMARY_TP_ACTIVATION = 0.65
-HIGH_MU_PRIMARY_TRAIL_CALLBACK = 0.15
-HIGH_MU_REVERSAL_DROP_TRIGGER = 0.2
-HIGH_MU_SECONDARY_STATIC_SL = 0.15
-HIGH_MU_SECONDARY_TP_ACTIVATION = 0.8
-HIGH_MU_SECONDARY_TRAIL_CALLBACK = 0.1
+# --- Numba Optimized Trading Core - STRATEGY 1 (HIGH VOLATILITY) ---
 
-# ==============================================================================
-# STRATEGY 2 PARAMETERS (Active when Mu < 100)
-# Logic: Gap Fill Short -> Main Long -> Reversal Short
-# ==============================================================================
-LOW_MU_ENTRY_DROP_THRESHOLD = 0.9 
-LOW_MU_PRE_DROP_SL = 0.6
-LOW_MU_STATIC_SL = 4.0
-LOW_MU_TP_ACTIVATION = 1.0
-LOW_MU_TRAIL_CALLBACK = 0.1
-LOW_MU_REVERSAL_RISE_TRIGGER = 0.2
-LOW_MU_SHORT_STATIC_SL = 0.15
-LOW_MU_SHORT_TP_ACTIVATION = 5.2
-LOW_MU_SHORT_TRAIL_CALLBACK = 0.04
-
-
-# ==============================================================================
-# NUMBA CORE 1: LOW MU STRATEGY (Mu < 100)
-# Logic: Pre-Drop Short (Gap Fill) -> Main Long -> Reversal Short
-# ==============================================================================
 @njit(cache=True, nogil=True)
-def backtest_core_low_mu(
+def backtest_strategy1(
     time_sec, price, 
     day_open_price,
-    start_index,       
-    can_trade,    
+    start_index,      
+    can_trade_short,   
     cooldown_seconds,
-    # Parameters
-    entry_drop_threshold,
-    pre_drop_sl,
-    static_sl, tp_activation, trail_callback,
-    reversal_rise_trigger,
-    short_static_sl, short_tp_activation, short_trail_callback
+    entry_rise_threshold,
+    pre_rise_sl
 ):
+    """
+    Strategy 1: High Volatility (sigma > 0.12)
+    Short-first strategy with gap-fill long
+    """
     n = len(price)
     signals = np.zeros(n, dtype=int64)
     positions = np.zeros(n, dtype=int64)
     
-    # State Variables
+    position = 0
+    entry_price = 0.0
+    
+    # Pre-Rise (Gap Fill) State
+    pre_rise_target = day_open_price + entry_rise_threshold
+    pre_rise_long_active = False
+    pending_short_flip = False
+    flip_wait_start_time = 0
+
+    short_trade_executed = False
+    
+    # Trailing State (Short - Primary)
+    short_trailing_active = False
+    short_trailing_valley_price = 0.0
+
+    # Trailing State (Long - Reversal)
+    long_trailing_active = False
+    long_trailing_peak_price = 0.0
+    
+    # Reversal Trigger State
+    waiting_for_long_reversal = False
+    long_reversal_target_price = 0.0
+    
+    last_signal_time = -cooldown_seconds - 1
+    
+    for i in range(n):
+        if i < start_index:
+            continue
+
+        curr_t = time_sec[i]
+        curr_p = price[i]
+        is_last_tick = (i == n - 1)
+        
+        signal = 0
+        
+        # FORCED SQUARE OFF (End of Day)
+        if is_last_tick and position != 0:
+            signal = -position 
+        
+        else:
+            # 30 MIN TRIGGER (GAP FILL LONG)
+            if i == start_index and can_trade_short and position == 0:
+                if curr_p < pre_rise_target:
+                    signal = 1
+                    pre_rise_long_active = True
+
+            # PRE-RISE LONG LOGIC
+            elif pre_rise_long_active:
+                if position == 1:
+                    # Stop Loss Check
+                    if (curr_p - entry_price) <= -pre_rise_sl:
+                        signal = -1
+                        pre_rise_long_active = False
+                    
+                    # Target Hit
+                    elif curr_p >= pre_rise_target:
+                        signal = -1
+                        pre_rise_long_active = False
+                        pending_short_flip = True
+                        flip_wait_start_time = curr_t
+            
+            # PENDING SHORT FLIP (Cooldown)
+            elif pending_short_flip:
+                if (curr_t - flip_wait_start_time) >= cooldown_seconds:
+                    signal = -1
+                    pending_short_flip = False
+                    short_trade_executed = True
+                    waiting_for_long_reversal = False
+
+            else:
+                # PRIMARY POSITION (SHORT)
+                if position == -1:
+                    pnl = entry_price - curr_p
+                    exit_signal = False
+                    
+                    # Static Stop Loss
+                    if pnl <= -S1_PRIMARY_STATIC_SL:
+                        exit_signal = True
+                    
+                    # Trailing Logic
+                    else:
+                        if not short_trailing_active:
+                            if pnl >= S1_PRIMARY_TP_ACTIVATION:
+                                short_trailing_active = True
+                                short_trailing_valley_price = curr_p
+                        
+                        if short_trailing_active:
+                            if curr_p < short_trailing_valley_price:
+                                short_trailing_valley_price = curr_p
+                            elif curr_p >= (short_trailing_valley_price + S1_PRIMARY_TRAIL_CALLBACK):
+                                exit_signal = True
+                    
+                    if exit_signal:
+                        signal = 1
+                        waiting_for_long_reversal = True
+                        long_reversal_target_price = curr_p - S1_REVERSAL_DROP_TRIGGER
+
+                # SECONDARY POSITION (LONG - REVERSAL)
+                elif position == 1:
+                    pnl = curr_p - entry_price
+                    exit_signal = False
+                    
+                    # Static Stop Loss
+                    if pnl <= -S1_SECONDARY_STATIC_SL:
+                        exit_signal = True
+                    
+                    # Trailing Logic
+                    else:
+                        if not long_trailing_active:
+                            if pnl >= S1_SECONDARY_TP_ACTIVATION:
+                                long_trailing_active = True
+                                long_trailing_peak_price = curr_p
+                        
+                        if long_trailing_active:
+                            if curr_p > long_trailing_peak_price:
+                                long_trailing_peak_price = curr_p
+                            elif curr_p <= (long_trailing_peak_price - S1_SECONDARY_TRAIL_CALLBACK):
+                                exit_signal = True
+
+                    if exit_signal:
+                        signal = -1
+
+                # FLAT (ENTRY) LOGIC
+                elif position == 0:
+                    
+                    # Check Reversal Long Trigger
+                    if waiting_for_long_reversal:
+                        if curr_p <= long_reversal_target_price:
+                            signal = 1
+                            waiting_for_long_reversal = False 
+                    
+                    # Check Primary Short Entry
+                    elif can_trade_short and not short_trade_executed:
+                        cooldown_over = (curr_t - last_signal_time) >= cooldown_seconds
+                        
+                        if cooldown_over:
+                            if curr_p >= pre_rise_target:
+                                signal = -1
+                                short_trade_executed = True
+                                waiting_for_long_reversal = False 
+        
+        # Apply Signal
+        if signal != 0:
+            if (position == 1 and signal == 1) or (position == -1 and signal == -1):
+                signal = 0
+            else:
+                if position == 0:
+                    entry_price = curr_p
+                    short_trailing_active = False
+                    short_trailing_valley_price = 0.0
+                    long_trailing_active = False
+                    long_trailing_peak_price = 0.0
+                
+                elif position != 0 and signal == -position:
+                    entry_price = 0.0
+                    short_trailing_active = False
+                    short_trailing_valley_price = 0.0
+                    long_trailing_active = False
+                    long_trailing_peak_price = 0.0
+                
+                position += signal
+                last_signal_time = curr_t
+        
+        signals[i] = signal
+        positions[i] = position
+        
+    return signals, positions
+
+# --- Numba Optimized Trading Core - STRATEGY 2 (MID VOLATILITY) ---
+
+@njit(cache=True, nogil=True)
+def backtest_strategy2(
+    time_sec, price, 
+    day_open_price,
+    start_index,      
+    can_trade_long,   
+    cooldown_seconds,
+    entry_drop_threshold 
+):
+    """
+    Strategy 2: Mid Volatility (0.09 <= sigma <= 0.12)
+    Long-first strategy with gap-fill short
+    """
+    n = len(price)
+    signals = np.zeros(n, dtype=int64)
+    positions = np.zeros(n, dtype=int64)
+    
     position = 0
     entry_price = 0.0
     
@@ -107,102 +306,107 @@ def backtest_core_low_mu(
     last_signal_time = -cooldown_seconds - 1
     
     for i in range(n):
-        if i < start_index: continue
+        if i < start_index:
+            continue
 
         curr_t = time_sec[i]
         curr_p = price[i]
         is_last_tick = (i == n - 1)
+        
         signal = 0
         
+        # FORCED SQUARE OFF (End of Day)
         if is_last_tick and position != 0:
-            signal = -position 
+            signal = -position
+        
         else:
-            # --- SPECIAL LOGIC: GAP FILL SHORT ---
-            if i == start_index and can_trade and position == 0:
+            # 30 MIN TRIGGER (GAP FILL SHORT)
+            if i == start_index and can_trade_long and position == 0:
                 if curr_p > pre_drop_target:
-                    signal = -1 # Enter Pre-Drop Short
+                    signal = -1
                     pre_drop_short_active = True
             
-            # --- A. PRE-DROP SHORT LOGIC ---
+            # PRE-DROP SHORT LOGIC
             elif pre_drop_short_active:
                 if position == -1:
-                    pnl_short = entry_price - curr_p
-                    
-                    # 1. Check STOP LOSS 
-                    if pnl_short <= -pre_drop_sl:
-                        signal = 1 # Close Short (SL Hit)
-                        pre_drop_short_active = False
-
-                    # 2. Check Target (Open - Threshold)
-                    elif curr_p <= pre_drop_target:
-                        signal = 1 # Close Short (Target Hit)
+                    if curr_p <= pre_drop_target:
+                        signal = 1
                         pre_drop_short_active = False
                         pending_long_flip = True
                         flip_wait_start_time = curr_t
             
-            # --- B. PENDING LONG FLIP ---
+            # PENDING LONG FLIP (Cooldown)
             elif pending_long_flip:
                 if (curr_t - flip_wait_start_time) >= cooldown_seconds:
-                    signal = 1 # Enter Long
+                    signal = 1
                     pending_long_flip = False
-                    waiting_for_short = False 
+                    waiting_for_short = False
             
-            # --- C. STANDARD STRATEGY LOGIC ---
             else:
-                # --- LONG POSITION LOGIC ---
+                # LONG POSITION LOGIC
                 if position == 1:
                     pnl = curr_p - entry_price
                     exit_signal = False
                     
-                    if pnl <= -static_sl:
+                    # Static Stop Loss
+                    if pnl <= -S2_STATIC_SL:
                         exit_signal = True
+                    
+                    # Trailing Logic
                     else:
                         if not trailing_active:
-                            if pnl >= tp_activation:
+                            if pnl >= S2_TP_ACTIVATION:
                                 trailing_active = True
                                 trailing_peak_price = curr_p
                         
                         if trailing_active:
                             if curr_p > trailing_peak_price:
                                 trailing_peak_price = curr_p
-                            elif curr_p <= (trailing_peak_price - trail_callback):
+                            elif curr_p <= (trailing_peak_price - S2_TRAIL_CALLBACK):
                                 exit_signal = True
                     
                     if exit_signal:
-                        signal = -1  # Close Long
+                        signal = -1
                         waiting_for_short = True
-                        short_target_price = curr_p + reversal_rise_trigger
+                        short_target_price = curr_p + S2_REVERSAL_RISE_TRIGGER
 
-                # --- SHORT POSITION LOGIC (REVERSAL SHORTS) ---
+                # SHORT POSITION LOGIC (REVERSAL SHORTS)
                 elif position == -1:
                     pnl = entry_price - curr_p
                     
-                    if pnl <= -short_static_sl:
-                        signal = 1 # Buy to Close (SL Hit)
+                    # Static Stop Loss
+                    if pnl <= -S2_SHORT_STATIC_SL:
+                        signal = 1
+                    
+                    # Trailing Logic
                     else:
                         if not short_trailing_active:
-                            if pnl >= short_tp_activation:
+                            if pnl >= S2_SHORT_TP_ACTIVATION:
                                 short_trailing_active = True
                                 short_trailing_valley_price = curr_p 
                         
                         if short_trailing_active:
                             if curr_p < short_trailing_valley_price:
                                 short_trailing_valley_price = curr_p
-                            elif curr_p >= (short_trailing_valley_price + short_trail_callback):
-                                signal = 1 # Buy to Close (Trailing Hit)
+                            elif curr_p >= (short_trailing_valley_price + S2_SHORT_TRAIL_CALLBACK):
+                                signal = 1
 
-                # --- FLAT (ENTRY) LOGIC ---
+                # FLAT (ENTRY) LOGIC
                 elif position == 0:
+                    
+                    # Check Reversal Short Trigger
                     if waiting_for_short:
                         if curr_p >= short_target_price:
-                            signal = -1  # Enter Short
+                            signal = -1
                             waiting_for_short = False 
                     
-                    elif can_trade:
+                    # Check Standard Long Entry
+                    elif can_trade_long:
                         cooldown_over = (curr_t - last_signal_time) >= cooldown_seconds
+                        
                         if cooldown_over:
                             if curr_p <= pre_drop_target:
-                                signal = 1 # Enter Long
+                                signal = 1
                                 waiting_for_short = False 
         
         # Apply Signal
@@ -216,12 +420,14 @@ def backtest_core_low_mu(
                     trailing_peak_price = 0.0
                     short_trailing_active = False
                     short_trailing_valley_price = 0.0
+                
                 elif position != 0 and signal == -position:
                     entry_price = 0.0
                     trailing_active = False
                     trailing_peak_price = 0.0
                     short_trailing_active = False
                     short_trailing_valley_price = 0.0
+                
                 position += signal
                 last_signal_time = curr_t
         
@@ -229,192 +435,12 @@ def backtest_core_low_mu(
         positions[i] = position
         
     return signals, positions
-
-
-# ==============================================================================
-# NUMBA CORE 2: HIGH MU STRATEGY (Mu > 100)
-# Logic: Pre-Rise Long (Gap Fill) -> Main Short -> Reversal Long
-# ==============================================================================
-@njit(cache=True, nogil=True)
-def backtest_core_high_mu(
-    time_sec, price, 
-    day_open_price,
-    start_index,      
-    can_trade,   
-    cooldown_seconds,
-    # Parameters
-    entry_rise_threshold,
-    pre_rise_sl,  # <--- NEW PARAMETER
-    primary_sl, primary_tp, primary_cb,
-    reversal_drop,
-    sec_sl, sec_tp, sec_cb
-):
-    n = len(price)
-    signals = np.zeros(n, dtype=int64)
-    positions = np.zeros(n, dtype=int64)
-    
-    # State Variables
-    position = 0
-    entry_price = 0.0
-    
-    # --- Pre-Rise (Gap Fill) State ---
-    pre_rise_target = day_open_price + entry_rise_threshold
-    pre_rise_long_active = False
-    pending_short_flip = False
-    flip_wait_start_time = 0
-
-    # Execution Flags
-    short_trade_executed = False  
-    
-    # Trailing State (Short - Primary)
-    short_trailing_active = False
-    short_trailing_valley_price = 0.0
-
-    # Trailing State (Long - Reversal)
-    long_trailing_active = False
-    long_trailing_peak_price = 0.0
-    
-    # Reversal Trigger State
-    waiting_for_long_reversal = False
-    long_reversal_target_price = 0.0
-    
-    last_signal_time = -cooldown_seconds - 1
-    
-    for i in range(n):
-        if i < start_index: continue
-
-        curr_t = time_sec[i]
-        curr_p = price[i]
-        is_last_tick = (i == n - 1)
-        signal = 0
-        
-        if is_last_tick and position != 0:
-            signal = -position 
-        else:
-            # --- SPECIAL LOGIC: GAP FILL LONG ---
-            if i == start_index and can_trade and position == 0:
-                if curr_p < pre_rise_target:
-                    signal = 1 # Enter Pre-Rise Long
-                    pre_rise_long_active = True
-
-            # --- A. PRE-RISE LONG LOGIC ---
-            elif pre_rise_long_active:
-                if position == 1:
-                    # --- NEW: STOP LOSS CHECK FOR PRE-RISE LONG ---
-                    if (curr_p - entry_price) <= -pre_rise_sl:
-                        signal = -1 # Close Long (Hit SL)
-                        pre_rise_long_active = False
-                        # Note: We do NOT trigger pending_short_flip here. We just go flat.
-
-                    # Check if we hit the target (Open + Threshold)
-                    elif curr_p >= pre_rise_target:
-                        signal = -1 # Close Long
-                        pre_rise_long_active = False
-                        pending_short_flip = True
-                        flip_wait_start_time = curr_t
-            
-            # --- B. PENDING SHORT FLIP ---
-            elif pending_short_flip:
-                if (curr_t - flip_wait_start_time) >= cooldown_seconds:
-                    signal = -1 # Enter Main Short
-                    pending_short_flip = False
-                    short_trade_executed = True 
-                    waiting_for_long_reversal = False 
-
-            # --- C. STANDARD STRATEGY LOGIC ---
-            else:
-                # --- PRIMARY POSITION (SHORT) ---
-                if position == -1:
-                    pnl = entry_price - curr_p
-                    exit_signal = False
-                    
-                    if pnl <= -primary_sl:
-                        exit_signal = True
-                    else:
-                        if not short_trailing_active:
-                            if pnl >= primary_tp:
-                                short_trailing_active = True
-                                short_trailing_valley_price = curr_p
-                        
-                        if short_trailing_active:
-                            if curr_p < short_trailing_valley_price:
-                                short_trailing_valley_price = curr_p
-                            elif curr_p >= (short_trailing_valley_price + primary_cb):
-                                exit_signal = True
-                    
-                    if exit_signal:
-                        signal = 1  # Buy to Close
-                        waiting_for_long_reversal = True
-                        long_reversal_target_price = curr_p - reversal_drop
-
-                # --- SECONDARY POSITION (LONG - REVERSAL) ---
-                elif position == 1:
-                    pnl = curr_p - entry_price
-                    exit_signal = False
-                    
-                    if pnl <= -sec_sl:
-                        exit_signal = True
-                    else:
-                        if not long_trailing_active:
-                            if pnl >= sec_tp:
-                                long_trailing_active = True
-                                long_trailing_peak_price = curr_p
-                        
-                        if long_trailing_active:
-                            if curr_p > long_trailing_peak_price:
-                                long_trailing_peak_price = curr_p
-                            elif curr_p <= (long_trailing_peak_price - sec_cb):
-                                exit_signal = True
-
-                    if exit_signal:
-                        signal = -1 # Sell to Close
-
-                # --- FLAT (ENTRY) LOGIC ---
-                elif position == 0:
-                    if waiting_for_long_reversal:
-                        if curr_p <= long_reversal_target_price:
-                            signal = 1  # Enter Long (Reversal)
-                            waiting_for_long_reversal = False 
-                    
-                    elif can_trade and not short_trade_executed:
-                        cooldown_over = (curr_t - last_signal_time) >= cooldown_seconds
-                        if cooldown_over:
-                            if curr_p >= pre_rise_target:
-                                signal = -1 # Enter Short
-                                short_trade_executed = True
-                                waiting_for_long_reversal = False 
-        
-        # Apply Signal
-        if signal != 0:
-            if (position == 1 and signal == 1) or (position == -1 and signal == -1):
-                signal = 0
-            else:
-                if position == 0:
-                    entry_price = curr_p
-                    short_trailing_active = False
-                    short_trailing_valley_price = 0.0
-                    long_trailing_active = False
-                    long_trailing_peak_price = 0.0
-                elif position != 0 and signal == -position:
-                    entry_price = 0.0
-                    short_trailing_active = False
-                    short_trailing_valley_price = 0.0
-                    long_trailing_active = False
-                    long_trailing_peak_price = 0.0
-                position += signal
-                last_signal_time = curr_t
-        
-        signals[i] = signal
-        positions[i] = position
-        
-    return signals, positions
-
 
 # --- Trade Reporting ---
 
 def generate_trade_reports_csv(output_file):
     SAVE_DIR = "/home/raid/Quant14/VB_Feature_Analysis/Histogram/"
-    SAVE_PATH = os.path.join(SAVE_DIR, "trade_reports_combined.csv")
+    SAVE_PATH = os.path.join(SAVE_DIR, "trade_reports.csv")
 
     os.makedirs(SAVE_DIR, exist_ok=True)
     
@@ -442,19 +468,16 @@ def generate_trade_reports_csv(output_file):
         if pd.isna(signal): continue
 
         if position is None:
-            # Entry (1 for Long, -1 for Short)
             if signal in [1, -1]:
                 position = signal
                 entry = row
         else:
-            # Exit
             if signal == -position:
                 direction = "LONG" if position == 1 else "SHORT"
                 pnl = (float(row["Price"]) - float(entry["Price"])) * position
                 
                 trades.append({
                     "day": entry["Day"],
-                    "strategy": row.get("Strategy", "Unknown"),
                     "direction": direction,
                     "entry_time": entry["Time"],
                     "entry_price": float(entry["Price"]),
@@ -497,9 +520,8 @@ def process_day(file_path: str, day_num: int, temp_dir: pathlib.Path, strategy_p
         if day_num in BLACKLIST_DAYS:
             df["Signal"] = 0
             df["Position"] = 0
-            df["Strategy"] = "Blacklist"
             output_path = temp_dir / f"day{day_num}.csv"
-            final_columns = REQUIRED_COLUMNS + ["Signal", "Position", "Day", "Strategy"]
+            final_columns = REQUIRED_COLUMNS + ["Signal", "Position", "Day"]
             df[final_columns].to_csv(output_path, index=False)
             return str(output_path)
 
@@ -512,57 +534,66 @@ def process_day(file_path: str, day_num: int, temp_dir: pathlib.Path, strategy_p
             
         day_open_price = price_arr[0]
         
-        # --- Volatility Gating & Strategy Selection ---
+        # --- Volatility Gating ---
         mask_30min = time_sec_arr <= DECISION_WINDOW_SECONDS
         
-        signals = np.zeros(len(price_arr), dtype=np.int64)
-        positions = np.zeros(len(price_arr), dtype=np.int64)
-        selected_strategy = "None"
-        
-        if np.any(mask_30min):
+        if not np.any(mask_30min):
+            can_trade = False
+            strategy_type = None
+            start_idx = 0
+        else:
             prices_30min = price_arr[mask_30min]
             mu = np.mean(prices_30min)
-            start_idx = np.searchsorted(time_sec_arr, DECISION_WINDOW_SECONDS, side='right')
-
-            # -----------------------------------------------
-            # STRATEGY SELECTION LOGIC
-            # -----------------------------------------------
+            sigma = np.std(prices_30min)
             
-            # CONDITION 1: Mu < 100 -> Strategy 2 (Gap Fill Short)
-            # (Naming conventions: Low Mu triggers Strategy 2 logic)
-            if mu < MU_THRESHOLD:
-                selected_strategy = "S2_LowMu"
-                signals, positions = backtest_core_low_mu(
-                    time_sec_arr, price_arr, day_open_price, int(start_idx), 
-                    True, COOLDOWN_PERIOD_SECONDS,
-                    # Pass Strat 2 Params
-                    LOW_MU_ENTRY_DROP_THRESHOLD, LOW_MU_PRE_DROP_SL,
-                    LOW_MU_STATIC_SL, LOW_MU_TP_ACTIVATION, LOW_MU_TRAIL_CALLBACK,
-                    LOW_MU_REVERSAL_RISE_TRIGGER,
-                    LOW_MU_SHORT_STATIC_SL, LOW_MU_SHORT_TP_ACTIVATION, LOW_MU_SHORT_TRAIL_CALLBACK
-                )
+            start_idx = np.searchsorted(time_sec_arr, DECISION_WINDOW_SECONDS, side='right')
+            
+            # Determine which strategy to use based on sigma
+            if sigma > SIGMA_HIGH_THRESHOLD and mu > MU_THRESHOLD:
+                # Strategy 1: High Volatility (Short-first)
+                can_trade = True
+                strategy_type = 1
+            elif SIGMA_MID_MIN <= sigma <= SIGMA_MID_MAX and mu < MU_THRESHOLD:
+                # Strategy 2: Mid Volatility (Long-first)
+                can_trade = True
+                strategy_type = 2
+            else:
+                # No strategy conditions met
+                can_trade = False
+                strategy_type = None
 
-            # CONDITION 2: Mu > 100 -> Strategy 1 (Gap Fill Long)
-            # (High Mu triggers Strategy 1 logic)
-            elif mu > MU_THRESHOLD:
-                selected_strategy = "S1_HighMu"
-                signals, positions = backtest_core_high_mu(
-                    time_sec_arr, price_arr, day_open_price, int(start_idx), 
-                    True, COOLDOWN_PERIOD_SECONDS,
-                    # Pass Strat 1 Params
-                    HIGH_MU_ENTRY_RISE_THRESHOLD,
-                    HIGH_MU_PRE_RISE_SL,  # <--- PASS NEW ARGUMENT
-                    HIGH_MU_PRIMARY_STATIC_SL, HIGH_MU_PRIMARY_TP_ACTIVATION, HIGH_MU_PRIMARY_TRAIL_CALLBACK,
-                    HIGH_MU_REVERSAL_DROP_TRIGGER,
-                    HIGH_MU_SECONDARY_STATIC_SL, HIGH_MU_SECONDARY_TP_ACTIVATION, HIGH_MU_SECONDARY_TRAIL_CALLBACK
-                )
-        
+        # Call appropriate Numba function based on strategy
+        if can_trade and strategy_type == 1:
+            signals, positions = backtest_strategy1(
+                time_sec_arr, 
+                price_arr, 
+                day_open_price,
+                int(start_idx),
+                True,
+                COOLDOWN_PERIOD_SECONDS,
+                S1_ENTRY_RISE_THRESHOLD,
+                S1_PRE_RISE_SL
+            )
+        elif can_trade and strategy_type == 2:
+            signals, positions = backtest_strategy2(
+                time_sec_arr, 
+                price_arr, 
+                day_open_price,
+                int(start_idx),
+                True,
+                COOLDOWN_PERIOD_SECONDS,
+                S2_ENTRY_DROP_THRESHOLD
+            )
+        else:
+            # No trading
+            signals = np.zeros(len(price_arr), dtype=np.int64)
+            positions = np.zeros(len(price_arr), dtype=np.int64)
+
         df["Signal"] = signals
         df["Position"] = positions
-        df["Strategy"] = selected_strategy
         
         output_path = temp_dir / f"day{day_num}.csv"
-        final_columns = REQUIRED_COLUMNS + ["Signal", "Position", "Day", "Strategy"]
+        final_columns = REQUIRED_COLUMNS + ["Signal", "Position", "Day"]
         df[final_columns].to_csv(output_path, index=False)
         
         del df
