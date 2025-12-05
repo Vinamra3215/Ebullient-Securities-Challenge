@@ -36,6 +36,9 @@ MU_THRESHOLD = 100.0
 # Entry (Long)
 ENTRY_DROP_THRESHOLD = 0.9  
 
+# Pre-Drop Short (Gap Fill) Specifics
+PRE_DROP_SL = 0.6  # <--- NEW PARAMETER: Static SL for the first 30min short
+
 # Exit (Long)
 STATIC_SL = 4.0
 TP_ACTIVATION = 1.0
@@ -60,7 +63,8 @@ def backtest_core(
     start_index,      
     can_trade_long,   
     cooldown_seconds,
-    entry_drop_threshold 
+    entry_drop_threshold,
+    pre_drop_sl  # <--- Added Argument
 ):
     """
     Numba Optimized Core with Pre-Drop Short (Gap-Fill) Logic.
@@ -123,9 +127,18 @@ def backtest_core(
             # If we are in the initial short leg waiting for price to drop
             elif pre_drop_short_active:
                 if position == -1:
-                    # Check if we hit the target (Open - Threshold)
-                    if curr_p <= pre_drop_target:
-                        signal = 1 # Close Short
+                    pnl_short = entry_price - curr_p
+                    
+                    # 1. Check STOP LOSS first (New Logic)
+                    if pnl_short <= -pre_drop_sl:
+                        signal = 1 # Close Short (SL Hit)
+                        pre_drop_short_active = False
+                        # Note: We do NOT trigger pending_long_flip here. 
+                        # If SL hits, we reset and let standard logic decide if we should enter Long later.
+
+                    # 2. Check Target (Open - Threshold)
+                    elif curr_p <= pre_drop_target:
+                        signal = 1 # Close Short (Target Hit)
                         pre_drop_short_active = False
                         # Prepare for Long Entry after cooldown
                         pending_long_flip = True
@@ -365,7 +378,8 @@ def process_day(file_path: str, day_num: int, temp_dir: pathlib.Path, strategy_p
             int(start_idx),
             bool(can_trade_long),
             COOLDOWN_PERIOD_SECONDS,
-            ENTRY_DROP_THRESHOLD
+            ENTRY_DROP_THRESHOLD,
+            PRE_DROP_SL  # <--- Added Argument
         )
 
         df["Signal"] = signals
@@ -450,4 +464,3 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     main(args.directory, args.max_workers, STRATEGY_PARAMS)
-
