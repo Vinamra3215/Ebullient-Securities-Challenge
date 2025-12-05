@@ -451,31 +451,3 @@ if __name__ == "__main__":
     main(args.directory, args.max_workers, STRATEGY_PARAMS)
 
 
-# === Backtest Summary ===
-# Initial Capital               : 100.00
-# Final Capital                 : 106.09
-# Total PnL                     : 6.09
-# Total Transaction Cost         : 1.23
-# Penalty Counts                : 0
-# Final Returns                 : 6.09%
-# CAGR                          : 5.4831%
-# Annualized Returns            : 5.4989%
-# Sharpe Ratio                  : 2.3876
-# Calmar Ratio                  : 4.3163
-# Maximum Drawdown              : -1.2740%
-# No. of Days                   : 279
-# Winning Days                  : 12
-# Losing Days                   : 4
-# Best Day                      : 127
-# Worst Day                     : 164
-# Best Day PnL                  : 1.40
-# Worst Day PnL                 : -0.36
-# Total Trades                  : 62
-# Winning Trades                : 31
-# Losing Trades                 : 31
-# Win Rate (%)                  : 50.00%
-# Average Winning Trade         : 0.4797
-# Average Losing Trade          : -0.1589
-# Average Hold Period (seconds) : 7,665.92
-# Average Hold Period (minutes) : 127.77
-# ========================
