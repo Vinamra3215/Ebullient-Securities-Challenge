@@ -48,6 +48,9 @@ SECONDARY_STATIC_SL = 0.15
 SECONDARY_TP_ACTIVATION = 0.8
 SECONDARY_TRAIL_CALLBACK = 0.1
 
+# 5. Pre-Rise Long Stop Loss (NEW)
+PRE_RISE_SL = 0.4
+
 COOLDOWN_PERIOD_SECONDS = 5
 
 # --- Numba Optimized Trading Core ---
@@ -58,10 +61,13 @@ def backtest_core(
     day_open_price,
     start_index,      
     can_trade_short,   
-    cooldown_seconds
+    cooldown_seconds,
+    entry_rise_threshold,
+    pre_rise_sl  # <--- NEW ARGUMENT
 ):
     """
-    Numba Optimized Core (SINGLE SEQUENCE: Short -> Long -> Stop).
+    Numba Optimized Core with Pre-Rise Long Logic.
+    Sequence: (Gap-Fill Long) -> [Flip] -> (Main Short) -> [Reversal] -> (Reversal Long).
     """
     n = len(price)
     signals = np.zeros(n, dtype=int64)
@@ -71,8 +77,14 @@ def backtest_core(
     position = 0
     entry_price = 0.0
     
-    # Execution Flags (NEW)
-    short_trade_executed = False  # Ensures we only take one Short per day
+    # --- Pre-Rise (Gap Fill) State ---
+    pre_rise_target = day_open_price + entry_rise_threshold
+    pre_rise_long_active = False
+    pending_short_flip = False
+    flip_wait_start_time = 0
+
+    # Execution Flags
+    short_trade_executed = False  # Ensures we only take one Main Short per day
     
     # Trailing State (Short - Primary)
     short_trailing_active = False
@@ -106,84 +118,122 @@ def backtest_core(
         
         # 3. Strategy Logic
         else:
-            # --- PRIMARY POSITION (SHORT) ---
-            if position == -1:
-                # PnL for Short = Entry - Current
-                pnl = entry_price - curr_p
-                exit_signal = False
-                
-                # A. Static Stop Loss
-                if pnl <= -PRIMARY_STATIC_SL:
-                    exit_signal = True
-                
-                # B. Trailing Logic
-                else:
-                    if not short_trailing_active:
-                        if pnl >= PRIMARY_TP_ACTIVATION:
-                            short_trailing_active = True
-                            short_trailing_valley_price = curr_p
-                    
-                    if short_trailing_active:
-                        if curr_p < short_trailing_valley_price:
-                            short_trailing_valley_price = curr_p
-                        elif curr_p >= (short_trailing_valley_price + PRIMARY_TRAIL_CALLBACK):
-                            exit_signal = True
-                
-                if exit_signal:
-                    signal = 1  # Buy to Close (Short Exit)
-                    # Setup Reversal Trigger (Looking for Long)
-                    waiting_for_long_reversal = True
-                    long_reversal_target_price = curr_p - REVERSAL_DROP_TRIGGER
+            # --- SPECIAL LOGIC: 30 MIN TRIGGER (GAP FILL LONG) ---
+            # If we are exactly at the start of the trading window
+            # Check if we are BELOW the rise threshold. If so, Long immediately.
+            if i == start_index and can_trade_short and position == 0:
+                if curr_p < pre_rise_target:
+                    signal = 1 # Enter Pre-Rise Long
+                    pre_rise_long_active = True
 
-            # --- SECONDARY POSITION (LONG - REVERSAL) ---
-            elif position == 1:
-                # PnL for Long = Current - Entry
-                pnl = curr_p - entry_price
-                exit_signal = False
-                
-                # A. Static Stop Loss
-                if pnl <= -SECONDARY_STATIC_SL:
-                    exit_signal = True
-                
-                # B. Trailing Logic
-                else:
-                    if not long_trailing_active:
-                        if pnl >= SECONDARY_TP_ACTIVATION:
-                            long_trailing_active = True
-                            long_trailing_peak_price = curr_p
+            # --- A. PRE-RISE LONG LOGIC ---
+            # We are holding the gap-fill Long, waiting for price to touch the threshold
+            elif pre_rise_long_active:
+                if position == 1:
                     
-                    if long_trailing_active:
-                        if curr_p > long_trailing_peak_price:
-                            long_trailing_peak_price = curr_p
-                        elif curr_p <= (long_trailing_peak_price - SECONDARY_TRAIL_CALLBACK):
-                            exit_signal = True
-
-                if exit_signal:
-                    signal = -1 # Sell to Close (Long Exit)
-                    # Sequence Complete. 
-                    # We do not reset short_trade_executed, so no more trades today.
-
-            # --- FLAT (ENTRY) LOGIC ---
-            elif position == 0:
-                
-                # A. Check Reversal Long Trigger First
-                # This is allowed only after the Short trade finishes
-                if waiting_for_long_reversal:
-                    if curr_p <= long_reversal_target_price:
-                        signal = 1  # Enter Long (Reversal)
-                        waiting_for_long_reversal = False 
-                
-                # B. Check Primary Short Entry
-                # Condition: Volatility OK AND No Short Executed Yet
-                if signal == 0 and can_trade_short and not short_trade_executed:
-                    cooldown_over = (curr_t - last_signal_time) >= cooldown_seconds
+                    # --- NEW: STOP LOSS CHECK FOR PRE-RISE LONG ---
+                    if (curr_p - entry_price) <= -pre_rise_sl:
+                        signal = -1 # Close Long (Hit SL)
+                        pre_rise_long_active = False
+                        # Note: We do NOT trigger pending_short_flip here because 
+                        # we failed to reach the top. We just go flat.
                     
-                    if cooldown_over:
-                        # Short Trigger: Price rises by 0.8 above Open
-                        if curr_p >= (day_open_price + ENTRY_RISE_THRESHOLD):
-                            signal = -1 # Enter Short
-                            short_trade_executed = True # Lock Short Entry for the day
+                    # Check if we hit the target (Open + 0.8)
+                    elif curr_p >= pre_rise_target:
+                        signal = -1 # Close Long (Square off)
+                        pre_rise_long_active = False
+                        # Prepare for Short Entry after cooldown
+                        pending_short_flip = True
+                        flip_wait_start_time = curr_t
+            
+            # --- B. PENDING SHORT FLIP (Cooldown) ---
+            # We just closed the Gap-Fill Long, waiting 5s to go Short
+            elif pending_short_flip:
+                if (curr_t - flip_wait_start_time) >= cooldown_seconds:
+                    signal = -1 # Enter Main Short
+                    pending_short_flip = False
+                    short_trade_executed = True # Lock Main Short
+                    waiting_for_long_reversal = False # Reset reversal trigger
+
+            # --- C. STANDARD STRATEGY LOGIC ---
+            else:
+                # --- PRIMARY POSITION (SHORT) ---
+                if position == -1:
+                    # PnL for Short = Entry - Current
+                    pnl = entry_price - curr_p
+                    exit_signal = False
+                    
+                    # A. Static Stop Loss
+                    if pnl <= -PRIMARY_STATIC_SL:
+                        exit_signal = True
+                    
+                    # B. Trailing Logic
+                    else:
+                        if not short_trailing_active:
+                            if pnl >= PRIMARY_TP_ACTIVATION:
+                                short_trailing_active = True
+                                short_trailing_valley_price = curr_p
+                        
+                        if short_trailing_active:
+                            if curr_p < short_trailing_valley_price:
+                                short_trailing_valley_price = curr_p
+                            elif curr_p >= (short_trailing_valley_price + PRIMARY_TRAIL_CALLBACK):
+                                exit_signal = True
+                    
+                    if exit_signal:
+                        signal = 1  # Buy to Close (Short Exit)
+                        # Setup Reversal Trigger (Looking for Long)
+                        waiting_for_long_reversal = True
+                        long_reversal_target_price = curr_p - REVERSAL_DROP_TRIGGER
+
+                # --- SECONDARY POSITION (LONG - REVERSAL) ---
+                elif position == 1:
+                    # PnL for Long = Current - Entry
+                    pnl = curr_p - entry_price
+                    exit_signal = False
+                    
+                    # A. Static Stop Loss
+                    if pnl <= -SECONDARY_STATIC_SL:
+                        exit_signal = True
+                    
+                    # B. Trailing Logic
+                    else:
+                        if not long_trailing_active:
+                            if pnl >= SECONDARY_TP_ACTIVATION:
+                                long_trailing_active = True
+                                long_trailing_peak_price = curr_p
+                        
+                        if long_trailing_active:
+                            if curr_p > long_trailing_peak_price:
+                                long_trailing_peak_price = curr_p
+                            elif curr_p <= (long_trailing_peak_price - SECONDARY_TRAIL_CALLBACK):
+                                exit_signal = True
+
+                    if exit_signal:
+                        signal = -1 # Sell to Close (Long Exit)
+                        # Sequence Complete. 
+
+                # --- FLAT (ENTRY) LOGIC ---
+                elif position == 0:
+                    
+                    # A. Check Reversal Long Trigger First
+                    if waiting_for_long_reversal:
+                        if curr_p <= long_reversal_target_price:
+                            signal = 1  # Enter Long (Reversal)
                             waiting_for_long_reversal = False 
+                    
+                    # B. Check Primary Short Entry
+                    # This runs if Pre-Rise Long didn't happen (price was already high),
+                    # OR if we were stopped out/flat and waiting.
+                    elif can_trade_short and not short_trade_executed:
+                        cooldown_over = (curr_t - last_signal_time) >= cooldown_seconds
+                        
+                        if cooldown_over:
+                            # Short Trigger: Price rises by 0.8 above Open
+                            if curr_p >= pre_rise_target:
+                                signal = -1 # Enter Short
+                                short_trade_executed = True # Lock Short Entry for the day
+                                waiting_for_long_reversal = False 
         
         # 4. Apply Signal
         if signal != 0:
@@ -340,7 +390,9 @@ def process_day(file_path: str, day_num: int, temp_dir: pathlib.Path, strategy_p
             day_open_price,
             int(start_idx),
             bool(can_trade_short),
-            COOLDOWN_PERIOD_SECONDS
+            COOLDOWN_PERIOD_SECONDS,
+            ENTRY_RISE_THRESHOLD,
+            PRE_RISE_SL  # <--- PASS NEW ARGUMENT
         )
 
         df["Signal"] = signals
@@ -349,7 +401,7 @@ def process_day(file_path: str, day_num: int, temp_dir: pathlib.Path, strategy_p
         output_path = temp_dir / f"day{day_num}.csv"
         final_columns = REQUIRED_COLUMNS + ["Signal", "Position", "Day"]
         df[final_columns].to_csv(output_path, index=False)
-        print(f"✅ Processed Day {day_num} | Volatile: {can_trade_short}")
+        # print(f"✅ Processed Day {day_num} | Volatile: {can_trade_short}")
         
         del df
         gc.collect()
