@@ -40,8 +40,8 @@ STRAT_1_PARAMS = {
     "static_sl": 0.7,
     "tp_activation": 1.0,
     "trail_callback": 0.1,
-    "short_static_sl": 4.4,
-    "short_tp_activation": 6.2,
+    "short_static_sl": 999.0,
+    "short_tp_activation": 999.0,
     "short_trail_callback": 0.04,
     "pre_drop_sl": 999.0  # Set high to effectively disable for Strat 1
 }
