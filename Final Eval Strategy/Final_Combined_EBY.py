@@ -139,8 +139,8 @@ CONFIG = {
     'P5_MEAN_THRESHOLD': 100.0,
     'P5_SIGMA_MIN': 0.03,
     'P5_SIGMA_MAX': 0.06,
-    'P5_TP_LONG': 0.5,
-    'P5_TP_SHORT': 0.55,
+    'P5_TP_LONG': 0.85,
+    'P5_TP_SHORT': 0.85,
     'P5_TRAILING_SL_INTERVAL': 1.5 * 60, # 90 seconds
 
     # ========================================================================
