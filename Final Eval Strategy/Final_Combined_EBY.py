@@ -137,7 +137,7 @@ CONFIG = {
     # ========================================================================
     'P5_DECISION_WINDOW': 30 * 60, # 1800 seconds
     'P5_MEAN_THRESHOLD': 100.0,
-    'P5_SIGMA_MIN': 0.00,
+    'P5_SIGMA_MIN': 0.03,
     'P5_SIGMA_MAX': 0.06,
     'P5_TP_LONG': 0.5,
     'P5_TP_SHORT': 0.55,
