@@ -155,10 +155,10 @@ def classify_regime_by_difference(cusum_up, cusum_down,
 
 @jit(nopython=True, fastmath=True)
 def generate_clean_signals(timestamps, prices, 
-                           is_stagnant,         # Master Filter (ATR)
-                           cusum_regime_int,    # Entry Filter (CUSUM)
-                           momentum,            # Entry & Exit Filter (Momentum)
-                           momentum_avg,        # Exit Filter (Momentum Average)
+                           is_stagnant,        # Master Filter (ATR)
+                           cusum_regime_int,   # Entry Filter (CUSUM)
+                           momentum,           # Entry & Exit Filter (Momentum)
+                           momentum_avg,       # Exit Filter (Momentum Average)
                            start_delay_seconds=1200.0,
                            min_hold_seconds=15.0,
                            min_cooldown_seconds=15.0,
@@ -360,7 +360,7 @@ def process_single_day(day_num, config):
         df_clean = df[all_cols].dropna().copy()
 
         if len(df_clean) < max(config['CUSUM_EWM_SPAN'], config['ATR_WINDOW'], 
-                                config['MOMENTUM_WINDOW'], config['MOMENTUM_AVG_WINDOW']):
+                               config['MOMENTUM_WINDOW'], config['MOMENTUM_AVG_WINDOW']):
             return {'day': day_num, 'success': False}
 
         # Get arrays
@@ -442,6 +442,15 @@ def process_single_day(day_num, config):
         pairs_025 = find_price_jump_pairs(prices, 0.25) # New (0.25)
         pairs_030 = find_price_jump_pairs(prices, 0.30) # New (0.30)
         
+        # Calculate average pair times
+        durations_020 = [timestamps[j] - timestamps[i] for i, j in pairs_020]
+        durations_025 = [timestamps[j] - timestamps[i] for i, j in pairs_025]
+        durations_030 = [timestamps[j] - timestamps[i] for i, j in pairs_030]
+
+        avg_time_020 = np.mean(durations_020) if durations_020 else 0.0
+        avg_time_025 = np.mean(durations_025) if durations_025 else 0.0
+        avg_time_030 = np.mean(durations_030) if durations_030 else 0.0
+        
         return {
             'day': day_num,
             'success': True,
@@ -451,6 +460,9 @@ def process_single_day(day_num, config):
             'num_pairs': len(pairs_020),     # Original threshold
             'num_pairs_025': len(pairs_025), # New threshold
             'num_pairs_030': len(pairs_030), # New threshold
+            'avg_pair_time_020': avg_time_020, # <<< MODIFIED
+            'avg_pair_time_025': avg_time_025, # <<< MODIFIED
+            'avg_pair_time_030': avg_time_030, # <<< MODIFIED
             'num_trades': num_trades,
             'price_min': price_min,
             'price_max': price_max,
@@ -465,7 +477,7 @@ def process_single_day(day_num, config):
 # SAVE SUMMARY TO FILE
 # ============================================================================
 
-def save_summary_to_file(all_results, config, output_path='price_summary_EBX.txt'):
+def save_summary_to_file(all_results, config, output_path='price_summary_EBY.txt'):
     """
     Save analysis summary to a text file with 3 categories
     """
@@ -512,25 +524,39 @@ def save_summary_to_file(all_results, config, output_path='price_summary_EBX.txt
         f.write(f"Number of days: {len(category_a)}\n\n")
         
         if len(category_a) > 0:
-            f.write("Day | P(0.20) | P(0.25) | P(0.30) | Trades | ATR Max  | Price Min | Price Max\n")
-            f.write("----|---------|---------|---------|--------|----------|-----------|----------\n")
+            # <<< MODIFIED Header
+            f.write("Day | P(0.20) | P(0.25) | P(0.30) | T(0.20) | T(0.25) | T(0.30) | Trades | ATR Max  | Price Min | Price Max\n")
+            f.write("----|---------|---------|---------|--------|--------|--------|--------|----------|-----------|----------\n")
             for result in category_a:
-                f.write(f"{result['day']:3d} | {result['num_pairs']:7d} | {result['num_pairs_025']:7d} | {result['num_pairs_030']:7d} | {result['num_trades']:6d} | "
-                        f"{result['atr_max']:8.6f} | {result['price_min']:9.2f} | {result['price_max']:9.2f}\n")
+                # <<< MODIFIED Row
+                f.write(f"{result['day']:3d} | {result['num_pairs']:7d} | {result['num_pairs_025']:7d} | {result['num_pairs_030']:7d} | "
+                        f"{result['avg_pair_time_020']:6.1f} | {result['avg_pair_time_025']:6.1f} | {result['avg_pair_time_030']:6.1f} | "
+                        f"{result['num_trades']:6d} | {result['atr_max']:8.6f} | {result['price_min']:9.2f} | {result['price_max']:9.2f}\n")
             
             total_pairs_a = sum(r['num_pairs'] for r in category_a)
             total_pairs_a_025 = sum(r['num_pairs_025'] for r in category_a)
             total_pairs_a_030 = sum(r['num_pairs_030'] for r in category_a)
             total_trades_a = sum(r['num_trades'] for r in category_a)
             
+            # <<< MODIFIED: Calculate total weighted time
+            total_time_a_020 = sum(r['avg_pair_time_020'] * r['num_pairs'] for r in category_a)
+            total_time_a_025 = sum(r['avg_pair_time_025'] * r['num_pairs_025'] for r in category_a)
+            total_time_a_030 = sum(r['avg_pair_time_030'] * r['num_pairs_030'] for r in category_a)
+
+            # <<< MODIFIED: Calculate overall average time (handle division by zero)
+            avg_time_a_020 = (total_time_a_020 / total_pairs_a) if total_pairs_a > 0 else 0.0
+            avg_time_a_025 = (total_time_a_025 / total_pairs_a_025) if total_pairs_a_025 > 0 else 0.0
+            avg_time_a_030 = (total_time_a_030 / total_pairs_a_030) if total_pairs_a_030 > 0 else 0.0
+            
             avg_pairs_a = total_pairs_a / len(category_a)
             avg_pairs_a_025 = total_pairs_a_025 / len(category_a)
             avg_pairs_a_030 = total_pairs_a_030 / len(category_a)
             avg_trades_a = total_trades_a / len(category_a)
             
-            f.write(f"\nTotal pairs (0.20): {total_pairs_a} | Avg: {avg_pairs_a:.2f}\n")
-            f.write(f"Total pairs (0.25): {total_pairs_a_025} | Avg: {avg_pairs_a_025:.2f}\n")
-            f.write(f"Total pairs (0.30): {total_pairs_a_030} | Avg: {avg_pairs_a_030:.2f}\n")
+            # <<< MODIFIED Summary Lines
+            f.write(f"\nTotal pairs (0.20): {total_pairs_a} | Avg (per day): {avg_pairs_a:.2f} | Avg Time (s): {avg_time_a_020:.1f}\n")
+            f.write(f"Total pairs (0.25): {total_pairs_a_025} | Avg (per day): {avg_pairs_a_025:.2f} | Avg Time (s): {avg_time_a_025:.1f}\n")
+            f.write(f"Total pairs (0.30): {total_pairs_a_030} | Avg (per day): {avg_pairs_a_030:.2f} | Avg Time (s): {avg_time_a_030:.1f}\n")
             f.write(f"Total trades: {total_trades_a} | Avg: {avg_trades_a:.2f}\n")
         else:
             f.write("No days in this category.\n")
@@ -543,25 +569,39 @@ def save_summary_to_file(all_results, config, output_path='price_summary_EBX.txt
         f.write(f"Number of days: {len(category_b)}\n\n")
         
         if len(category_b) > 0:
-            f.write("Day | P(0.20) | P(0.25) | P(0.30) | Trades | ATR Max  | Price Min | Price Max\n")
-            f.write("----|---------|---------|---------|--------|----------|-----------|----------\n")
+            # <<< MODIFIED Header
+            f.write("Day | P(0.20) | P(0.25) | P(0.30) | T(0.20) | T(0.25) | T(0.30) | Trades | ATR Max  | Price Min | Price Max\n")
+            f.write("----|---------|---------|---------|--------|--------|--------|--------|----------|-----------|----------\n")
             for result in category_b:
-                f.write(f"{result['day']:3d} | {result['num_pairs']:7d} | {result['num_pairs_025']:7d} | {result['num_pairs_030']:7d} | {result['num_trades']:6d} | "
-                        f"{result['atr_max']:8.6f} | {result['price_min']:9.2f} | {result['price_max']:9.2f}\n")
+                # <<< MODIFIED Row
+                f.write(f"{result['day']:3d} | {result['num_pairs']:7d} | {result['num_pairs_025']:7d} | {result['num_pairs_030']:7d} | "
+                        f"{result['avg_pair_time_020']:6.1f} | {result['avg_pair_time_025']:6.1f} | {result['avg_pair_time_030']:6.1f} | "
+                        f"{result['num_trades']:6d} | {result['atr_max']:8.6f} | {result['price_min']:9.2f} | {result['price_max']:9.2f}\n")
             
             total_pairs_b = sum(r['num_pairs'] for r in category_b)
             total_pairs_b_025 = sum(r['num_pairs_025'] for r in category_b)
             total_pairs_b_030 = sum(r['num_pairs_030'] for r in category_b)
             total_trades_b = sum(r['num_trades'] for r in category_b)
             
+            # <<< MODIFIED: Calculate total weighted time
+            total_time_b_020 = sum(r['avg_pair_time_020'] * r['num_pairs'] for r in category_b)
+            total_time_b_025 = sum(r['avg_pair_time_025'] * r['num_pairs_025'] for r in category_b)
+            total_time_b_030 = sum(r['avg_pair_time_030'] * r['num_pairs_030'] for r in category_b)
+
+            # <<< MODIFIED: Calculate overall average time (handle division by zero)
+            avg_time_b_020 = (total_time_b_020 / total_pairs_b) if total_pairs_b > 0 else 0.0
+            avg_time_b_025 = (total_time_b_025 / total_pairs_b_025) if total_pairs_b_025 > 0 else 0.0
+            avg_time_b_030 = (total_time_b_030 / total_pairs_b_030) if total_pairs_b_030 > 0 else 0.0
+            
             avg_pairs_b = total_pairs_b / len(category_b)
             avg_pairs_b_025 = total_pairs_b_025 / len(category_b)
             avg_pairs_b_030 = total_pairs_b_030 / len(category_b)
             avg_trades_b = total_trades_b / len(category_b)
 
-            f.write(f"\nTotal pairs (0.20): {total_pairs_b} | Avg: {avg_pairs_b:.2f}\n")
-            f.write(f"Total pairs (0.25): {total_pairs_b_025} | Avg: {avg_pairs_b_025:.2f}\n")
-            f.write(f"Total pairs (0.30): {total_pairs_b_030} | Avg: {avg_pairs_b_030:.2f}\n")
+            # <<< MODIFIED Summary Lines
+            f.write(f"\nTotal pairs (0.20): {total_pairs_b} | Avg (per day): {avg_pairs_b:.2f} | Avg Time (s): {avg_time_b_020:.1f}\n")
+            f.write(f"Total pairs (0.25): {total_pairs_b_025} | Avg (per day): {avg_pairs_b_025:.2f} | Avg Time (s): {avg_time_b_025:.1f}\n")
+            f.write(f"Total pairs (0.30): {total_pairs_b_030} | Avg (per day): {avg_pairs_b_030:.2f} | Avg Time (s): {avg_time_b_030:.1f}\n")
             f.write(f"Total trades: {total_trades_b} | Avg: {avg_trades_b:.2f}\n")
         else:
             f.write("No days in this category.\n")
@@ -574,25 +614,39 @@ def save_summary_to_file(all_results, config, output_path='price_summary_EBX.txt
         f.write(f"Number of days: {len(category_c)}\n\n")
         
         if len(category_c) > 0:
-            f.write("Day | P(0.20) | P(0.25) | P(0.30) | Trades | ATR Max  | Price Min | Price Max\n")
-            f.write("----|---------|---------|---------|--------|----------|-----------|----------\n")
+            # <<< MODIFIED Header
+            f.write("Day | P(0.20) | P(0.25) | P(0.30) | T(0.20) | T(0.25) | T(0.30) | Trades | ATR Max  | Price Min | Price Max\n")
+            f.write("----|---------|---------|---------|--------|--------|--------|--------|----------|-----------|----------\n")
             for result in category_c:
-                f.write(f"{result['day']:3d} | {result['num_pairs']:7d} | {result['num_pairs_025']:7d} | {result['num_pairs_030']:7d} | {result['num_trades']:6d} | "
-                        f"{result['atr_max']:8.6f} | {result['price_min']:9.2f} | {result['price_max']:9.2f}\n")
+                # <<< MODIFIED Row
+                f.write(f"{result['day']:3d} | {result['num_pairs']:7d} | {result['num_pairs_025']:7d} | {result['num_pairs_030']:7d} | "
+                        f"{result['avg_pair_time_020']:6.1f} | {result['avg_pair_time_025']:6.1f} | {result['avg_pair_time_030']:6.1f} | "
+                        f"{result['num_trades']:6d} | {result['atr_max']:8.6f} | {result['price_min']:9.2f} | {result['price_max']:9.2f}\n")
             
             total_pairs_c = sum(r['num_pairs'] for r in category_c)
             total_pairs_c_025 = sum(r['num_pairs_025'] for r in category_c)
             total_pairs_c_030 = sum(r['num_pairs_030'] for r in category_c)
             total_trades_c = sum(r['num_trades'] for r in category_c)
             
+            # <<< MODIFIED: Calculate total weighted time
+            total_time_c_020 = sum(r['avg_pair_time_020'] * r['num_pairs'] for r in category_c)
+            total_time_c_025 = sum(r['avg_pair_time_025'] * r['num_pairs_025'] for r in category_c)
+            total_time_c_030 = sum(r['avg_pair_time_030'] * r['num_pairs_030'] for r in category_c)
+
+            # <<< MODIFIED: Calculate overall average time (handle division by zero)
+            avg_time_c_020 = (total_time_c_020 / total_pairs_c) if total_pairs_c > 0 else 0.0
+            avg_time_c_025 = (total_time_c_025 / total_pairs_c_025) if total_pairs_c_025 > 0 else 0.0
+            avg_time_c_030 = (total_time_c_030 / total_pairs_c_030) if total_pairs_c_030 > 0 else 0.0
+            
             avg_pairs_c = total_pairs_c / len(category_c)
             avg_pairs_c_025 = total_pairs_c_025 / len(category_c)
             avg_pairs_c_030 = total_pairs_c_030 / len(category_c)
             avg_trades_c = total_trades_c / len(category_c)
             
-            f.write(f"\nTotal pairs (0.20): {total_pairs_c} | Avg: {avg_pairs_c:.2f}\n")
-            f.write(f"Total pairs (0.25): {total_pairs_c_025} | Avg: {avg_pairs_c_025:.2f}\n")
-            f.write(f"Total pairs (0.30): {total_pairs_c_030} | Avg: {avg_pairs_c_030:.2f}\n")
+            # <<< MODIFIED Summary Lines
+            f.write(f"\nTotal pairs (0.20): {total_pairs_c} | Avg (per day): {avg_pairs_c:.2f} | Avg Time (s): {avg_time_c_020:.1f}\n")
+            f.write(f"Total pairs (0.25): {total_pairs_c_025} | Avg (per day): {avg_pairs_c_025:.2f} | Avg Time (s): {avg_time_c_025:.1f}\n")
+            f.write(f"Total pairs (0.30): {total_pairs_c_030} | Avg (per day): {avg_pairs_c_030:.2f} | Avg Time (s): {avg_time_c_030:.1f}\n")
             f.write(f"Total trades: {total_trades_c} | Avg: {avg_trades_c:.2f}\n")
         else:
             f.write("No days in this category.\n")
@@ -613,6 +667,16 @@ def save_summary_to_file(all_results, config, output_path='price_summary_EBX.txt
         total_pairs_030 = sum(r['num_pairs_030'] for r in all_results)
         total_trades = sum(r['num_trades'] for r in all_results)
         
+        # <<< MODIFIED: Calculate total weighted time
+        total_time_020 = sum(r['avg_pair_time_020'] * r['num_pairs'] for r in all_results)
+        total_time_025 = sum(r['avg_pair_time_025'] * r['num_pairs_025'] for r in all_results)
+        total_time_030 = sum(r['avg_pair_time_030'] * r['num_pairs_030'] for r in all_results)
+
+        # <<< MODIFIED: Calculate overall average time (handle division by zero)
+        avg_time_020 = (total_time_020 / total_pairs) if total_pairs > 0 else 0.0
+        avg_time_025 = (total_time_025 / total_pairs_025) if total_pairs_025 > 0 else 0.0
+        avg_time_030 = (total_time_030 / total_pairs_030) if total_pairs_030 > 0 else 0.0
+        
         f.write(f"Total price jump pairs (0.20): {total_pairs}\n")
         f.write(f"Total price jump pairs (0.25): {total_pairs_025}\n")
         f.write(f"Total price jump pairs (0.30): {total_pairs_030}\n")
@@ -623,6 +687,11 @@ def save_summary_to_file(all_results, config, output_path='price_summary_EBX.txt
             f.write(f"Average pairs per day (0.25): {total_pairs_025/len(all_results):.2f}\n")
             f.write(f"Average pairs per day (0.30): {total_pairs_030/len(all_results):.2f}\n")
             f.write(f"Average trades per day (all days): {total_trades/len(all_results):.2f}\n")
+            
+            # <<< MODIFIED: Added overall average time
+            f.write(f"\nOverall avg pair time (0.20): {avg_time_020:.1f}s\n")
+            f.write(f"Overall avg pair time (0.25): {avg_time_025:.1f}s\n")
+            f.write(f"Overall avg pair time (0.30): {avg_time_030:.1f}s\n")
         
         # *** MODIFICATION END ***
         
@@ -683,9 +752,20 @@ def main():
         total_pairs_a_030 = sum(r['num_pairs_030'] for r in category_a)
         total_trades_a = sum(r['num_trades'] for r in category_a)
         
-        print(f"Total pairs (0.20): {total_pairs_a} | Avg: {total_pairs_a/len(category_a):.2f}")
-        print(f"Total pairs (0.25): {total_pairs_a_025} | Avg: {total_pairs_a_025/len(category_a):.2f}")
-        print(f"Total pairs (0.30): {total_pairs_a_030} | Avg: {total_pairs_a_030/len(category_a):.2f}")
+        # <<< MODIFIED: Calculate total weighted time
+        total_time_a_020 = sum(r['avg_pair_time_020'] * r['num_pairs'] for r in category_a)
+        total_time_a_025 = sum(r['avg_pair_time_025'] * r['num_pairs_025'] for r in category_a)
+        total_time_a_030 = sum(r['avg_pair_time_030'] * r['num_pairs_030'] for r in category_a)
+
+        # <<< MODIFIED: Calculate overall average time (handle division by zero)
+        avg_time_a_020 = (total_time_a_020 / total_pairs_a) if total_pairs_a > 0 else 0.0
+        avg_time_a_025 = (total_time_a_025 / total_pairs_a_025) if total_pairs_a_025 > 0 else 0.0
+        avg_time_a_030 = (total_time_a_030 / total_pairs_a_030) if total_pairs_a_030 > 0 else 0.0
+
+        # <<< MODIFIED Print Lines
+        print(f"Total pairs (0.20): {total_pairs_a} | Avg (per day): {total_pairs_a/len(category_a):.2f} | Avg Time (s): {avg_time_a_020:.1f}")
+        print(f"Total pairs (0.25): {total_pairs_a_025} | Avg (per day): {total_pairs_a_025/len(category_a):.2f} | Avg Time (s): {avg_time_a_025:.1f}")
+        print(f"Total pairs (0.30): {total_pairs_a_030} | Avg (per day): {total_pairs_a_030/len(category_a):.2f} | Avg Time (s): {avg_time_a_030:.1f}")
         print(f"Total trades: {total_trades_a} | Avg: {total_trades_a/len(category_a):.2f}")
     
     print("\n" + "="*80)
@@ -698,9 +778,20 @@ def main():
         total_pairs_b_030 = sum(r['num_pairs_030'] for r in category_b)
         total_trades_b = sum(r['num_trades'] for r in category_b)
 
-        print(f"Total pairs (0.20): {total_pairs_b} | Avg: {total_pairs_b/len(category_b):.2f}")
-        print(f"Total pairs (0.25): {total_pairs_b_025} | Avg: {total_pairs_b_025/len(category_b):.2f}")
-        print(f"Total pairs (0.30): {total_pairs_b_030} | Avg: {total_pairs_b_030/len(category_b):.2f}")
+        # <<< MODIFIED: Calculate total weighted time
+        total_time_b_020 = sum(r['avg_pair_time_020'] * r['num_pairs'] for r in category_b)
+        total_time_b_025 = sum(r['avg_pair_time_025'] * r['num_pairs_025'] for r in category_b)
+        total_time_b_030 = sum(r['avg_pair_time_030'] * r['num_pairs_030'] for r in category_b)
+
+        # <<< MODIFIED: Calculate overall average time (handle division by zero)
+        avg_time_b_020 = (total_time_b_020 / total_pairs_b) if total_pairs_b > 0 else 0.0
+        avg_time_b_025 = (total_time_b_025 / total_pairs_b_025) if total_pairs_b_025 > 0 else 0.0
+        avg_time_b_030 = (total_time_b_030 / total_pairs_b_030) if total_pairs_b_030 > 0 else 0.0
+
+        # <<< MODIFIED Print Lines
+        print(f"Total pairs (0.20): {total_pairs_b} | Avg (per day): {total_pairs_b/len(category_b):.2f} | Avg Time (s): {avg_time_b_020:.1f}")
+        print(f"Total pairs (0.25): {total_pairs_b_025} | Avg (per day): {total_pairs_b_025/len(category_b):.2f} | Avg Time (s): {avg_time_b_025:.1f}")
+        print(f"Total pairs (0.30): {total_pairs_b_030} | Avg (per day): {total_pairs_b_030/len(category_b):.2f} | Avg Time (s): {avg_time_b_030:.1f}")
         print(f"Total trades: {total_trades_b} | Avg: {total_trades_b/len(category_b):.2f}")
     
     print("\n" + "="*80)
@@ -713,9 +804,20 @@ def main():
         total_pairs_c_030 = sum(r['num_pairs_030'] for r in category_c)
         total_trades_c = sum(r['num_trades'] for r in category_c)
         
-        print(f"Total pairs (0.20): {total_pairs_c} | Avg: {total_pairs_c/len(category_c):.2f}")
-        print(f"Total pairs (0.25): {total_pairs_c_025} | Avg: {total_pairs_c_025/len(category_c):.2f}")
-        print(f"Total pairs (0.30): {total_pairs_c_030} | Avg: {total_pairs_c_030/len(category_c):.2f}")
+        # <<< MODIFIED: Calculate total weighted time
+        total_time_c_020 = sum(r['avg_pair_time_020'] * r['num_pairs'] for r in category_c)
+        total_time_c_025 = sum(r['avg_pair_time_025'] * r['num_pairs_025'] for r in category_c)
+        total_time_c_030 = sum(r['avg_pair_time_030'] * r['num_pairs_030'] for r in category_c)
+
+        # <<< MODIFIED: Calculate overall average time (handle division by zero)
+        avg_time_c_020 = (total_time_c_020 / total_pairs_c) if total_pairs_c > 0 else 0.0
+        avg_time_c_025 = (total_time_c_025 / total_pairs_c_025) if total_pairs_c_025 > 0 else 0.0
+        avg_time_c_030 = (total_time_c_030 / total_pairs_c_030) if total_pairs_c_030 > 0 else 0.0
+        
+        # <<< MODIFIED Print Lines
+        print(f"Total pairs (0.20): {total_pairs_c} | Avg (per day): {total_pairs_c/len(category_c):.2f} | Avg Time (s): {avg_time_c_020:.1f}")
+        print(f"Total pairs (0.25): {total_pairs_c_025} | Avg (per day): {total_pairs_c_025/len(category_c):.2f} | Avg Time (s): {avg_time_c_025:.1f}")
+        print(f"Total pairs (0.30): {total_pairs_c_030} | Avg (per day): {total_pairs_c_030/len(category_c):.2f} | Avg Time (s): {avg_time_c_030:.1f}")
         print(f"Total trades: {total_trades_c} | Avg: {total_trades_c/len(category_c):.2f}")
     
     print("\n" + "="*80)
@@ -731,10 +833,21 @@ def main():
     total_pairs_030 = sum(r['num_pairs_030'] for r in all_results)
     total_trades = sum(r['num_trades'] for r in all_results)
 
-    print(f"\nTotal pairs (0.20): {total_pairs} | Avg: {total_pairs/len(all_results):.2f}")
-    print(f"Total pairs (0.25): {total_pairs_025} | Avg: {total_pairs_025/len(all_results):.2f}")
-    print(f"Total pairs (0.30): {total_pairs_030} | Avg: {total_pairs_030/len(all_results):.2f}")
-    print(f"Total strategy trades: {total_trades} | Avg: {total_trades/len(all_results):.2f}")
+    # <<< MODIFIED: Calculate total weighted time
+    total_time_020 = sum(r['avg_pair_time_020'] * r['num_pairs'] for r in all_results)
+    total_time_025 = sum(r['avg_pair_time_025'] * r['num_pairs_025'] for r in all_results)
+    total_time_030 = sum(r['avg_pair_time_030'] * r['num_pairs_030'] for r in all_results)
+
+    # <<< MODIFIED: Calculate overall average time (handle division by zero)
+    avg_time_020 = (total_time_020 / total_pairs) if total_pairs > 0 else 0.0
+    avg_time_025 = (total_time_025 / total_pairs_025) if total_pairs_025 > 0 else 0.0
+    avg_time_030 = (total_time_030 / total_pairs_030) if total_pairs_030 > 0 else 0.0
+
+    # <<< MODIFIED Print Lines
+    print(f"\nTotal pairs (0.20): {total_pairs} | Avg (per day): {total_pairs/len(all_results):.2f} | Overall Avg Time (s): {avg_time_020:.1f}")
+    print(f"Total pairs (0.25): {total_pairs_025} | Avg (per day): {total_pairs_025/len(all_results):.2f} | Overall Avg Time (s): {avg_time_025:.1f}")
+    print(f"Total pairs (0.30): {total_pairs_030} | Avg (per day): {total_pairs_030/len(all_results):.2f} | Overall Avg Time (s): {avg_time_030:.1f}")
+    print(f"Total strategy trades: {total_trades} | Avg (per day): {total_trades/len(all_results):.2f}")
     
     # *** MODIFICATION END ***
     
@@ -772,9 +885,10 @@ def get_pairs_for_day(day_num):
         prices = df[price_col].dropna().values.astype(np.float64)
         
         # Find price jump pairs using the main threshold
-        pairs = find_price_jump_pairs(prices, CONFIG['PRICE_JUMP_THRESHOLD'])
+        current_threshold = 0.3 # User's hardcoded value
+        pairs = find_price_jump_pairs(prices, current_threshold) # <<< MODIFIED (used variable)
         
-        print(f"Day {day_num}: Found {len(pairs)} pairs with threshold {CONFIG['PRICE_JUMP_THRESHOLD']}")
+        print(f"Day {day_num}: Found {len(pairs)} pairs with threshold {current_threshold}") # <<< MODIFIED (fixed bug)
         
         return True, pairs, df
         
