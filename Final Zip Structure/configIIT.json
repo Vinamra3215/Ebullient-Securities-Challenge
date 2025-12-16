@@ -1,0 +1,10 @@
+{
+    "data_path": "/data/quant14",
+    "start_date": 0,
+    "end_date": 1,
+    "timer": 600,
+    "tcost": 2,
+    "broadcast": [
+        "EBX"
+    ]
+}
