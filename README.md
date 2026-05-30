@@ -1,4 +1,4 @@
-<![CDATA[<div align="center">
+<div align="center">
 
 # 🏆 Ebullient Securities — Algorithmic Strategy Development
 
@@ -309,6 +309,3 @@ python "Final Zip Structure/mainIIT.py" "Final Zip Structure/configIIT.json"
 *Ebullient Securities — Quantitative Proprietary Trading Challenge*
 
 </div>
-]]>
-
-
